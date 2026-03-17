@@ -6,7 +6,7 @@ sacrebleu
 matplotlib
 requests
 numpy
+
+# Optional (safe-ish)
 sudachipy
 sudachidict_core
-fugashi
-unidic-lite
