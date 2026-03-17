@@ -9,10 +9,113 @@ from io import BytesIO
 import numpy as np
 
 st.set_page_config(layout="wide")
-st.title("📊 MT Evaluation Tool (BLEU + chrF++ + Optional COMET)")
+st.title("📊 MT Evaluation Tool (Advanced Multilingual + Japanese NLP Support)")
 
 # ======================
-# Tabs
+# WARNING
+# ======================
+st.warning(
+    "⚠️ Experimental Feature: Linguistic error analysis uses heuristic and tokenizer-based methods. Results may vary depending on tokenizer availability (SudachiPy/MeCab)."
+)
+
+# ======================
+# TOKENIZER SETUP
+# ======================
+tokenizer_mode = "char"
+
+# Try SudachiPy
+try:
+    from sudachipy import tokenizer as sudachi_tokenizer
+    from sudachipy import dictionary
+
+    sudachi_obj = dictionary.Dictionary().create()
+    tokenizer_mode = "sudachi"
+except:
+    # Try MeCab (via fugashi)
+    try:
+        from fugashi import Tagger
+        mecab = Tagger()
+        tokenizer_mode = "mecab"
+    except:
+        tokenizer_mode = "char"
+
+def tokenize(text, lang):
+    if lang in ["ja", "zh-cn", "zh-tw", "ko"]:
+
+        if tokenizer_mode == "sudachi":
+            return [m.surface() for m in sudachi_obj.tokenize(text)]
+
+        elif tokenizer_mode == "mecab":
+            return [word.surface for word in mecab(text)]
+
+        else:
+            return list(text.strip())
+
+    else:
+        return text.split()
+
+# ======================
+# ERROR ANALYSIS V4
+# ======================
+def error_analysis_v4(src, mt, ref, tgt_lang="en"):
+
+    try:
+        errors = []
+
+        mt_tokens = tokenize(mt, tgt_lang)
+        ref_tokens = tokenize(ref, tgt_lang)
+        src_tokens = tokenize(src, tgt_lang)
+
+        # ===== CONTENT =====
+        if len(mt_tokens) < 0.7 * len(ref_tokens):
+            errors.append("Omission")
+
+        if len(mt_tokens) > 1.3 * len(ref_tokens):
+            errors.append("Addition")
+
+        overlap = len(set(mt_tokens) & set(ref_tokens)) / max(len(set(ref_tokens)), 1)
+
+        if overlap < 0.3:
+            errors.append("Mistranslation")
+
+        # ===== LEXICAL =====
+        if overlap < 0.5 and len(mt_tokens) > 0.8 * len(ref_tokens):
+            errors.append("Lexical Choice")
+
+        shared = set(src_tokens) & set(mt_tokens)
+        if len(shared) > 2:
+            errors.append("Untranslated Segment")
+
+        # ===== FORMAL =====
+        if re.findall(r"\d+", mt) != re.findall(r"\d+", ref):
+            errors.append("Number Mismatch")
+
+        if mt.count("。") != ref.count("。") and mt.count(".") != ref.count("."):
+            errors.append("Punctuation Error")
+
+        # ===== GRAMMAR (ONLY ENGLISH) =====
+        if tgt_lang == "en":
+
+            if re.search(r"\b(he|she|it)\s+go\b", mt):
+                errors.append("Agreement Error")
+
+            if "very" in mt and not re.search(r"\b(is|are|was|were)\b", mt):
+                errors.append("Missing Copula")
+
+            if re.search(r"\b(am|is|are)\s+\w+\b", mt):
+                if "ing" not in mt:
+                    errors.append("Incorrect Verb Form")
+
+            if "yesterday" in ref and "go" in mt:
+                errors.append("Tense Error")
+
+        return ", ".join(sorted(set(errors))) if errors else "OK"
+
+    except:
+        return "Unknown"
+
+# ======================
+# TABS
 # ======================
 tab1, tab2 = st.tabs(["📂 Upload & Settings", "📈 Results"])
 
@@ -39,11 +142,7 @@ with tab2:
 
     if uploaded_file:
 
-        try:
-            df = pd.read_excel(uploaded_file)
-        except:
-            st.error("Failed to read file. Please upload valid Excel.")
-            st.stop()
+        df = pd.read_excel(uploaded_file)
 
         if df.shape[1] < 3:
             st.error("File must have at least 3 columns: source, mt, ref")
@@ -53,7 +152,7 @@ with tab2:
         df.columns = ["source", "mt", "ref"]
 
         # ======================
-        # Language Detection
+        # LANGUAGE DETECTION
         # ======================
         try:
             src_lang = detect(str(df["source"].iloc[0]))
@@ -61,16 +160,14 @@ with tab2:
         except:
             src_lang, tgt_lang = "unknown", "unknown"
 
-        st.write(f"Detected Language: {src_lang} → {tgt_lang}")
+        st.write(f"Detected: {src_lang} → {tgt_lang}")
+        st.write(f"Tokenizer mode: {tokenizer_mode}")
 
         # ======================
-        # Preprocessing
+        # CLEAN
         # ======================
         def clean(x):
-            try:
-                return str(x).strip().lower()
-            except:
-                return str(x)
+            return str(x).strip().lower()
 
         df["mt_clean"] = df["mt"].apply(clean)
         df["ref_clean"] = df["ref"].apply(clean)
@@ -80,197 +177,58 @@ with tab2:
             # ======================
             # METRICS
             # ======================
-            try:
-                bleu = sacrebleu.corpus_bleu(df["mt_clean"], [df["ref_clean"]])
-                chrf = sacrebleu.corpus_chrf(
-                    df["mt_clean"],
-                    [df["ref_clean"]],
-                    word_order=2  # chrF++
-                )
+            bleu = sacrebleu.corpus_bleu(df["mt_clean"], [df["ref_clean"]])
+            chrf = sacrebleu.corpus_chrf(df["mt_clean"], [df["ref_clean"]], word_order=2)
 
-                st.subheader("📊 Metrics")
-                st.write(f"BLEU: {bleu.score:.2f}")
-                st.write(f"chrF++: {chrf.score:.2f}")
+            st.subheader("📊 Metrics")
 
-            except:
-                st.warning("Metric calculation failed")
+            colA, colB = st.columns(2)
+            colA.metric("BLEU", f"{bleu.score:.2f}")
+            colB.metric("chrF++", f"{chrf.score:.2f}")
 
             # ======================
-            # Sentence-level
+            # SENTENCE LEVEL
             # ======================
-            def safe_bleu(mt, ref):
-                try:
-                    return sacrebleu.sentence_bleu(mt, [ref]).score
-                except:
-                    return np.nan
-
-            def safe_chrf(mt, ref):
-                try:
-                    return sacrebleu.sentence_chrf(mt, [ref], word_order=2).score
-                except:
-                    return np.nan
-
             df["bleu_sent"] = [
-                safe_bleu(m, r) for m, r in zip(df["mt_clean"], df["ref_clean"])
+                sacrebleu.sentence_bleu(m, [r]).score for m, r in zip(df["mt_clean"], df["ref_clean"])
             ]
 
             df["chrf_sent"] = [
-                safe_chrf(m, r) for m, r in zip(df["mt_clean"], df["ref_clean"])
+                sacrebleu.sentence_chrf(m, [r], word_order=2).score for m, r in zip(df["mt_clean"], df["ref_clean"])
             ]
 
             # ======================
-            # COMET (optional)
+            # ERROR ANALYSIS
             # ======================
-            if api_key:
-                st.subheader("🧠 COMET (Optional)")
-                try:
-                    url = "https://api-inference.huggingface.co/models/Unbabel/wmt22-comet-da"
-                    headers = {"Authorization": f"Bearer {api_key}"}
-
-                    data = {
-                        "inputs": [
-                            {"src": s, "mt": m, "ref": r}
-                            for s, m, r in zip(df["source"], df["mt"], df["ref"])
-                        ]
-                    }
-
-                    response = requests.post(url, headers=headers, json=data)
-
-                    if response.status_code == 200:
-                        result = response.json()
-                        df["comet"] = [x["score"] for x in result]
-                        st.success("COMET success")
-                    else:
-                        st.warning("COMET API failed")
-
-                except Exception as e:
-                    st.warning(f"COMET error: {e}")
-
-            # ======================
-            # Interpretation
-            # ======================
-            def interpret(score):
-                if pd.isna(score):
-                    return "Unrated"
-                if score > 50:
-                    return "Good"
-                elif score > 30:
-                    return "Fair"
-                else:
-                    return "Poor"
-
-            df["quality"] = df["bleu_sent"].apply(interpret)
-
-            # ======================
-            # Error Analysis
-            # ======================
-            def error_analysis(src, mt, ref):
-                try:
-                    errors = []
-
-                    mt_tokens = mt.split()
-                    ref_tokens = ref.split()
-
-                    if len(mt_tokens) < 0.7 * len(ref_tokens):
-                        errors.append("Omission")
-
-                    if len(mt_tokens) > 1.3 * len(ref_tokens):
-                        errors.append("Addition")
-
-                    overlap = len(set(mt_tokens) & set(ref_tokens)) / max(len(set(ref_tokens)), 1)
-
-                    if overlap < 0.3:
-                        errors.append("Mistranslation")
-
-                    if overlap < 0.5 and len(mt_tokens) > 0.8 * len(ref_tokens):
-                        errors.append("Lexical Choice")
-
-                    if any(word in mt_tokens for word in src.split()):
-                        errors.append("Untranslated")
-
-                    if re.findall(r"\d+", mt) != re.findall(r"\d+", ref):
-                        errors.append("Number Mismatch")
-
-                    if mt.count(".") != ref.count("."):
-                        errors.append("Punctuation Error")
-
-                    return ", ".join(set(errors)) if errors else "OK"
-                except:
-                    return "Unknown"
-
             df["error_type"] = [
-                error_analysis(s.lower(), m.lower(), r.lower())
+                error_analysis_v4(s, m, r, tgt_lang)
                 for s, m, r in zip(df["source"], df["mt"], df["ref"])
             ]
 
             # ======================
-            # Visualization
+            # VISUALIZATION
             # ======================
-            col1, col2 = st.columns(2)
-
-            with col1:
-                try:
-                    fig, ax = plt.subplots()
-                    ax.hist(df["bleu_sent"].dropna(), bins=20)
-                    ax.set_title("BLEU Distribution")
-                    st.pyplot(fig)
-                except:
-                    st.write("Visualization unavailable")
-
-            with col2:
-                try:
-                    st.bar_chart(df["quality"].value_counts())
-                except:
-                    pass
-
-            st.subheader("📈 BLEU vs chrF++ Comparison")
-            try:
-                compare_df = pd.DataFrame({
-                    "BLEU": df["bleu_sent"],
-                    "chrF++": df["chrf_sent"]
-                })
-                st.line_chart(compare_df)
-            except:
-                st.write("Comparison unavailable")
+            st.subheader("📈 chrF++ Distribution")
+            fig, ax = plt.subplots()
+            ax.hist(df["chrf_sent"], bins=20)
+            st.pyplot(fig)
 
             st.subheader("⚠️ Error Distribution")
-            try:
-                st.bar_chart(df["error_type"].value_counts())
-            except:
-                pass
+            st.bar_chart(df["error_type"].value_counts())
 
             # ======================
-            # Table
+            # TABLE
             # ======================
-            st.subheader("📋 Detailed Results")
             st.dataframe(df)
 
             # ======================
-            # Export Excel
+            # EXPORT
             # ======================
-            try:
-                excel_buffer = BytesIO()
-                df.to_excel(excel_buffer, index=False)
-
-                st.download_button(
-                    "⬇️ Download Excel",
-                    data=excel_buffer.getvalue(),
-                    file_name="mt_results.xlsx"
-                )
-            except:
-                st.warning("Excel export failed")
-
-            # ======================
-            # Export TXT
-            # ======================
-            def generate_txt(df):
-                text = "MT Evaluation Report\n\n"
-                for i, row in df.iterrows():
-                    text += f"{i+1}. {row['mt']} | {row['quality']} | {row['error_type']}\n"
-                return text
+            excel_buffer = BytesIO()
+            df.to_excel(excel_buffer, index=False)
 
             st.download_button(
-                "⬇️ Download TXT",
-                data=generate_txt(df),
-                file_name="mt_report.txt"
+                "⬇️ Download Excel",
+                data=excel_buffer.getvalue(),
+                file_name="mt_results.xlsx"
             )
