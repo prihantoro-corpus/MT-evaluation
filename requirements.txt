@@ -1,1 +1,8 @@
-
+streamlit
+pandas
+openpyxl
+langdetect
+sacrebleu
+matplotlib
+requests
+numpy
