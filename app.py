@@ -9,55 +9,47 @@ from io import BytesIO
 import numpy as np
 
 st.set_page_config(layout="wide")
-st.title("📊 MT Evaluation Tool (Advanced Multilingual + Japanese NLP Support)")
+st.title("📊 MT Evaluation Tool (Stable Multilingual Version)")
 
 # ======================
 # WARNING
 # ======================
 st.warning(
-    "⚠️ Experimental Feature: Linguistic error analysis uses heuristic and tokenizer-based methods. Results may vary depending on tokenizer availability (SudachiPy/MeCab)."
+    "⚠️ Experimental Feature: Linguistic error analysis is heuristic-based. "
+    "For Japanese/Chinese/Korean, character-based fallback is used if tokenizer is unavailable."
 )
 
 # ======================
-# TOKENIZER SETUP
+# TOKENIZER SETUP (SAFE)
 # ======================
 tokenizer_mode = "char"
 
-# Try SudachiPy
 try:
-    from sudachipy import tokenizer as sudachi_tokenizer
     from sudachipy import dictionary
-
     sudachi_obj = dictionary.Dictionary().create()
     tokenizer_mode = "sudachi"
 except:
-    # Try MeCab (via fugashi)
-    try:
-        from fugashi import Tagger
-        mecab = Tagger()
-        tokenizer_mode = "mecab"
-    except:
-        tokenizer_mode = "char"
+    tokenizer_mode = "char"
+
+def is_cjk(lang):
+    return lang in ["ja", "zh-cn", "zh-tw", "ko"]
 
 def tokenize(text, lang):
-    if lang in ["ja", "zh-cn", "zh-tw", "ko"]:
-
+    if is_cjk(lang):
         if tokenizer_mode == "sudachi":
-            return [m.surface() for m in sudachi_obj.tokenize(text)]
-
-        elif tokenizer_mode == "mecab":
-            return [word.surface for word in mecab(text)]
-
+            try:
+                return [m.surface() for m in sudachi_obj.tokenize(text)]
+            except:
+                return list(text.strip())
         else:
             return list(text.strip())
-
     else:
         return text.split()
 
 # ======================
-# ERROR ANALYSIS V4
+# ERROR ANALYSIS
 # ======================
-def error_analysis_v4(src, mt, ref, tgt_lang="en"):
+def error_analysis(src, mt, ref, tgt_lang):
 
     try:
         errors = []
@@ -93,7 +85,7 @@ def error_analysis_v4(src, mt, ref, tgt_lang="en"):
         if mt.count("。") != ref.count("。") and mt.count(".") != ref.count("."):
             errors.append("Punctuation Error")
 
-        # ===== GRAMMAR (ONLY ENGLISH) =====
+        # ===== GRAMMAR (ENGLISH ONLY)
         if tgt_lang == "en":
 
             if re.search(r"\b(he|she|it)\s+go\b", mt):
@@ -115,7 +107,7 @@ def error_analysis_v4(src, mt, ref, tgt_lang="en"):
         return "Unknown"
 
 # ======================
-# TABS
+# UI TABS
 # ======================
 tab1, tab2 = st.tabs(["📂 Upload & Settings", "📈 Results"])
 
@@ -130,9 +122,9 @@ with tab1:
         uploaded_file = st.file_uploader("Upload Excel (.xlsx)", type=["xlsx"])
 
     with col2:
-        mode = st.radio("Mode", ["Lite (default)", "Advanced (API optional)"])
+        mode = st.radio("Mode", ["Lite", "Advanced (COMET optional)"])
         api_key = None
-        if mode == "Advanced (API optional)":
+        if mode == "Advanced (COMET optional)":
             api_key = st.text_input("HuggingFace API Key", type="password")
 
 # ======================
@@ -142,7 +134,11 @@ with tab2:
 
     if uploaded_file:
 
-        df = pd.read_excel(uploaded_file)
+        try:
+            df = pd.read_excel(uploaded_file)
+        except:
+            st.error("Failed to read Excel file.")
+            st.stop()
 
         if df.shape[1] < 3:
             st.error("File must have at least 3 columns: source, mt, ref")
@@ -163,6 +159,9 @@ with tab2:
         st.write(f"Detected: {src_lang} → {tgt_lang}")
         st.write(f"Tokenizer mode: {tokenizer_mode}")
 
+        if is_cjk(tgt_lang):
+            st.info("🈶 CJK detected → using character/token hybrid strategy")
+
         # ======================
         # CLEAN
         # ======================
@@ -177,41 +176,115 @@ with tab2:
             # ======================
             # METRICS
             # ======================
-            bleu = sacrebleu.corpus_bleu(df["mt_clean"], [df["ref_clean"]])
-            chrf = sacrebleu.corpus_chrf(df["mt_clean"], [df["ref_clean"]], word_order=2)
+            try:
+                bleu = sacrebleu.corpus_bleu(df["mt_clean"], [df["ref_clean"]])
+                chrf = sacrebleu.corpus_chrf(
+                    df["mt_clean"],
+                    [df["ref_clean"]],
+                    word_order=2
+                )
 
-            st.subheader("📊 Metrics")
+                st.subheader("📊 Metrics")
 
-            colA, colB = st.columns(2)
-            colA.metric("BLEU", f"{bleu.score:.2f}")
-            colB.metric("chrF++", f"{chrf.score:.2f}")
+                colA, colB = st.columns(2)
+                colA.metric("BLEU", f"{bleu.score:.2f}")
+                colB.metric("chrF++", f"{chrf.score:.2f}")
+
+                if is_cjk(tgt_lang):
+                    st.caption("👉 chrF++ is more reliable for CJK languages.")
+
+            except:
+                st.warning("Metric calculation failed")
 
             # ======================
             # SENTENCE LEVEL
             # ======================
-            df["bleu_sent"] = [
-                sacrebleu.sentence_bleu(m, [r]).score for m, r in zip(df["mt_clean"], df["ref_clean"])
-            ]
+            def safe_bleu(mt, ref):
+                try:
+                    return sacrebleu.sentence_bleu(mt, [ref]).score
+                except:
+                    return np.nan
 
-            df["chrf_sent"] = [
-                sacrebleu.sentence_chrf(m, [r], word_order=2).score for m, r in zip(df["mt_clean"], df["ref_clean"])
-            ]
+            def safe_chrf(mt, ref):
+                try:
+                    return sacrebleu.sentence_chrf(mt, [ref], word_order=2).score
+                except:
+                    return np.nan
+
+            df["bleu_sent"] = [safe_bleu(m, r) for m, r in zip(df["mt_clean"], df["ref_clean"])]
+            df["chrf_sent"] = [safe_chrf(m, r) for m, r in zip(df["mt_clean"], df["ref_clean"])]
+
+            # ======================
+            # COMET (OPTIONAL)
+            # ======================
+            if api_key:
+                st.subheader("🧠 COMET (Optional)")
+                try:
+                    url = "https://api-inference.huggingface.co/models/Unbabel/wmt22-comet-da"
+                    headers = {"Authorization": f"Bearer {api_key}"}
+
+                    data = {
+                        "inputs": [
+                            {"src": s, "mt": m, "ref": r}
+                            for s, m, r in zip(df["source"], df["mt"], df["ref"])
+                        ]
+                    }
+
+                    response = requests.post(url, headers=headers, json=data)
+
+                    if response.status_code == 200:
+                        result = response.json()
+                        df["comet"] = [x["score"] for x in result]
+                        st.success("COMET success")
+                    else:
+                        st.warning("COMET API failed")
+
+                except Exception as e:
+                    st.warning(f"COMET error: {e}")
+
+            # ======================
+            # QUALITY LABEL
+            # ======================
+            def interpret(score):
+                if pd.isna(score):
+                    return "Unrated"
+                elif score > 65:
+                    return "Good"
+                elif score > 40:
+                    return "Fair"
+                else:
+                    return "Poor"
+
+            df["quality"] = df["bleu_sent"].apply(interpret)
 
             # ======================
             # ERROR ANALYSIS
             # ======================
             df["error_type"] = [
-                error_analysis_v4(s, m, r, tgt_lang)
+                error_analysis(s, m, r, tgt_lang)
                 for s, m, r in zip(df["source"], df["mt"], df["ref"])
             ]
 
             # ======================
             # VISUALIZATION
             # ======================
-            st.subheader("📈 chrF++ Distribution")
-            fig, ax = plt.subplots()
-            ax.hist(df["chrf_sent"], bins=20)
-            st.pyplot(fig)
+            col1, col2 = st.columns(2)
+
+            with col1:
+                fig, ax = plt.subplots()
+                ax.hist(df["chrf_sent"].dropna(), bins=20)
+                ax.set_title("chrF++ Distribution")
+                st.pyplot(fig)
+
+            with col2:
+                st.bar_chart(df["quality"].value_counts())
+
+            st.subheader("📈 BLEU vs chrF++")
+            compare_df = pd.DataFrame({
+                "BLEU": df["bleu_sent"],
+                "chrF++": df["chrf_sent"]
+            })
+            st.line_chart(compare_df)
 
             st.subheader("⚠️ Error Distribution")
             st.bar_chart(df["error_type"].value_counts())
@@ -219,6 +292,7 @@ with tab2:
             # ======================
             # TABLE
             # ======================
+            st.subheader("📋 Detailed Results")
             st.dataframe(df)
 
             # ======================
@@ -231,4 +305,16 @@ with tab2:
                 "⬇️ Download Excel",
                 data=excel_buffer.getvalue(),
                 file_name="mt_results.xlsx"
+            )
+
+            def generate_txt(df):
+                text = "MT Evaluation Report\n\n"
+                for i, row in df.iterrows():
+                    text += f"{i+1}. {row['mt']} | {row['quality']} | {row['error_type']}\n"
+                return text
+
+            st.download_button(
+                "⬇️ Download TXT",
+                data=generate_txt(df),
+                file_name="mt_report.txt"
             )
